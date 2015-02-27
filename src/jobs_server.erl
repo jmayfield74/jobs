@@ -1,5 +1,5 @@
 %%==============================================================================
-%% Copyright 2010 Erlang Solutions Ltd.
+%% Copyright 2014 Ulf Wiger
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,11 +16,11 @@
 
 %%-------------------------------------------------------------------
 %% File    : jobs_server.erl
-%% @author  : Ulf Wiger <ulf.wiger@erlang-solutions.com>
+%% @author  : Ulf Wiger <ulf@wiger.net>
 %% @end
-%% Description : 
+%% Description :
 %%
-%% Created : 15 Jan 2010 by Ulf Wiger <ulf.wiger@erlang-solutions.com>
+%% Created : 15 Jan 2010 by Ulf Wiger <ulf@wiger.net>
 %%-------------------------------------------------------------------
 -module(jobs_server).
 -behaviour(gen_server).
@@ -38,6 +38,7 @@
 
 %% Config API
 -export([add_queue/2,
+	 modify_queue/2,
          delete_queue/1,
          add_counter/2,
          modify_counter/2,
@@ -148,6 +149,11 @@ dequeue(Type, N) when N==infinity; is_integer(N), N > 0 ->
 %%
 add_queue(Name, Options) ->
     call(?SERVER, {add_queue, Name, Options}).
+
+-spec modify_queue(queue_name(), [option()]) -> ok.
+%%
+modify_queue(Name, Options) ->
+    call(?SERVER, {modify_queue, Name, Options}).
 
 -spec delete_queue(queue_name()) -> ok.
 delete_queue(Name) ->
@@ -694,6 +700,22 @@ i_handle_call({add_queue, Name, Options}, _, #st{queues = Qs} = S) ->
     NewQueues = init_queues([{Name, Options}], S),
     revisit_queue(Name),
     {reply, ok, lift_counters(S#st{queues = Qs ++ NewQueues})};
+i_handle_call({modify_queue, Name, Options}, _, #st{queues = Qs} = S) ->
+    case get_queue(Name, Qs) of
+	false ->
+	    {reply, {error, not_found}, S};
+	#queue{} = Q ->
+	    Q1 = lists:foldl(
+		   fun({max_size, Sz}, Qx) when is_integer(Sz), Sz >= 0;
+						Sz==undefined ->
+			   Qx#queue{max_size = Sz};
+		      ({max_time, T}, Qx) when is_integer(T), T >= 0;
+					       T==undefined ->
+			   Qx#queue{max_time = T}
+		   end, Q, Options),
+	    revisit_queue(Name),
+	    {reply, ok, update_queue(Q1, S)}
+    end;
 i_handle_call({delete_queue, Name}, _, #st{queues = Qs} = S) ->
     case get_queue(Name, Qs) of
         false ->
@@ -803,7 +825,7 @@ i_handle_call({ask_queue, QName, Req}, From, #st{queues = Qs} = S) ->
 						  Q#queue{stateful = Stf1})}
 		end,
 	    %% We don't catch errors; this is done at the level above.
-	    %% One possible error is that the queue module doesn't have a 
+	    %% One possible error is that the queue module doesn't have a
 	    %% handle_call/3 callback.
 	    case ask_stateful(Req, From, Stf, S#st.info_f) of
 		badarg -> {reply, badarg, S};
@@ -897,7 +919,9 @@ do_get_queue_info(rate_limit, #queue{regulators = Rs}) ->
 	    Limit;
 	false ->
 	    undefined
-    end.
+    end;
+do_get_queue_info(Item, Q) ->
+    jobs_info:'#get-queue'(Item, Q).
 
 get_queue(Name, Qs) ->
     lists:keyfind(Name, #queue.name, Qs).
@@ -1016,7 +1040,8 @@ maybe_cancel_timer(#queue{timer = TRef} = Q) ->
     erlang:cancel_timer(TRef),
     Q#queue{timer = undefined}.
 
-
+check_queue(#queue{type = {action, approve}}, _TS, _S) ->
+    {0, [], []};
 check_queue(#queue{type = #producer{}} = Q, TS, S) ->
     do_check_queue(Q, TS, S);
 check_queue(#queue{} = Q, TS, S) ->
@@ -1288,7 +1313,7 @@ restore_counter({C, I}, {Revisit, #st{counters = Counters} = S}) ->
     CR1 = CR#cr{value = Val - I},
     Counters1 = lists:keyreplace(C, #cr.name, Counters, CR1),
     S1 = S#st{counters = Counters1},
-    {union(Qs, Revisit), S1}. 
+    {union(Qs, Revisit), S1}.
 
 union(L1, L2) ->
     (L1 -- L2) ++ L2.
@@ -1338,8 +1363,11 @@ start_timer(#queue{name = Name} = Q) ->
             Q
     end.
 
-do_send_after(T, Msg) ->
-    erlang:send_after(T, self(), Msg).
+do_send_after(T, Msg) when T > 0 ->
+    erlang:send_after(T, self(), Msg);
+do_send_after(_, Msg) ->
+    self() ! Msg,
+    undefined.
 
 apply_modifiers(Modifiers, #queue{regulators = Rs} = Q) ->
     Rs1 = [apply_modifiers(Modifiers, R) || R <- Rs],
@@ -1396,7 +1424,12 @@ apply_damper(Type, Found, Local, Remote, R) ->
 				 RU * max_remotes(Remote)
 			 end,
 	    apply_corr(Type, LocalCorr + RemoteCorr, R);
-	{_, F} when tuple_size(F) == 2; is_function(F,2) ->
+	{_, {M,F}} ->
+	    case M:F(Local, Remote) of
+		Corr when is_integer(Corr) ->
+		    apply_corr(Type, Corr, R)
+	    end;
+	{_, F} when is_function(F,2) ->
 	    case F(Local, Remote) of
 		Corr when is_integer(Corr) ->
 		    apply_corr(Type, Corr, R)
@@ -1449,7 +1482,7 @@ queue_job(TS, From, #queue{max_size = MaxSz} = Q, S) ->
             case q_timedout(Q) of
                 [] ->
                     reject(From),
-                    S;
+                    {Q, S};
                 {OldJobs, Q1} ->
                     [timeout(J) || J <- OldJobs],
                     %% update_queue(q_in(TS, From, Q1), S)
@@ -1490,7 +1523,7 @@ select_queue(Type, _, #st{q_select = M, q_select_st = MS, info_f = I} = S) ->
 %% The callback module must implement the functions below.
 %%
 q_new(Opts) ->
-    [Name, Mod, Type, Stateful, MaxTime, MaxSize] = 
+    [Name, Mod, Type, Stateful, MaxTime, MaxSize] =
         [get_value(K, Opts, Def) || {K, Def} <- [{name, undefined},
                                                  {mod , jobs_queue},
 						 {type, fifo},
@@ -1545,6 +1578,7 @@ init_producer(Type, _Opts, Q) ->
 
 q_all     (#queue{mod = Mod} = Q)     -> Mod:all     (Q).
 q_timedout(#queue{mod = Mod} = Q)     -> Mod:timedout(Q).
+q_delete  (#queue{mod = undefined})   -> ok;
 q_delete  (#queue{mod = Mod} = Q)     -> Mod:delete  (Q).
 %%
 %q_is_empty(#queue{type = #producer{}}) -> false;
@@ -1672,4 +1706,3 @@ get_first_value(K, [{K, V}|_], _) ->
     V;
 get_first_value(_, [], Default) ->
     Default.
-
